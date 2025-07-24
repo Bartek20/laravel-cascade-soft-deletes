@@ -4,9 +4,21 @@ namespace Dyrynda\Database\Support;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Facades\Date;
+
+// Dummy class to hold the soft delete timestamp
+// This is used to ensure that the timestamp is shared across all models
+// that are using the CascadeSoftDeletes trait.
+class CascadeSoftDeleteTimestamp {
+    static public $callerModel = null;
+    static public $softDeleteTimestamp = null;
+}
 
 trait CascadeSoftDeletes
 {
+    use SoftDeletes;
     /**
      * Boot the trait.
      *
@@ -19,8 +31,20 @@ trait CascadeSoftDeletes
     {
         static::deleting(function ($model) {
             $model->validateCascadingSoftDelete();
+            if (CascadeSoftDeleteTimestamp::$softDeleteTimestamp == null) {
+                CascadeSoftDeleteTimestamp::$softDeleteTimestamp = Date::now();
+                CascadeSoftDeleteTimestamp::$callerModel = $model;
+                $model->runCascadingDeletes();
+            }
+            else {
+                $model->runCascadingDeletes();
+            }
+        });
 
-            $model->runCascadingDeletes();
+        static::deleted(function ($model) {
+            if (!CascadeSoftDeleteTimestamp::$callerModel->is($model)) return;
+            CascadeSoftDeleteTimestamp::$softDeleteTimestamp = null;
+            CascadeSoftDeleteTimestamp::$callerModel = null;
         });
     }
 
@@ -64,7 +88,7 @@ trait CascadeSoftDeletes
     protected function cascadeSoftDeletes($relationship)
     {
         $delete = $this->forceDeleting ? 'forceDelete' : 'delete';
-
+        
         $cb = function($model) use ($delete) {
             isset($model->pivot) ? $model->pivot->{$delete}() : $model->{$delete}();
         };
@@ -75,11 +99,30 @@ trait CascadeSoftDeletes
     private function handleRecords($relationship, $cb)
     {
         $fetchMethod = $this->fetchMethod ?? 'get';
+        $model = $this->{$relationship}()->first();
+        $primary = $this->getRelationPrimaryKey($model);
+        $hasRelationships = $this->hasDescendantRelationships($model);
+        $delete = $this->forceDeleting ? 'forceDelete' : 'delete';
 
         if ($fetchMethod == 'chunk') {
-            $this->{$relationship}()->chunk($this->chunkSize ?? 500, $cb);
+            while ($models = $this->{$relationship}()->select($primary)->limit($this->chunkSize ?? 500)->get()) {
+                if ($models->isEmpty()) {
+                    break;
+                }
+                if (!$hasRelationships) {
+                    $this->{$relationship}()->whereIn($primary, $models->pluck($primary))->{$delete}();
+                    continue;
+                }
+                foreach($models as $model) {
+                    $cb($model);
+                }
+            }
         } else {
-            foreach($this->{$relationship}()->$fetchMethod() as $model) {
+            if (!$hasRelationships) {
+                $this->{$relationship}()->select($primary)->{$delete}();
+                return;
+            }
+            foreach($this->{$relationship}()->select($primary)->$fetchMethod() as $model) {
                 $cb($model);
             }
         }
@@ -129,10 +172,44 @@ trait CascadeSoftDeletes
      *
      * @return array
      */
-    protected function getActiveCascadingDeletes()
+    public function getActiveCascadingDeletes()
     {
         return array_filter($this->getCascadingDeletes(), function ($relationship) {
             return $this->{$relationship}()->exists();
         });
+    }
+
+    /**
+     * Get the primary key for the relationship model.
+     *
+     * @param  Model  $model
+     * @return string
+     */
+    private function getRelationPrimaryKey($model) {
+        return $model->getKeyName();
+    }
+
+    /**
+     * Check if the model has any descendant relationships that also use cascading soft deletes.
+     *
+     * @param  Model  $model
+     * @return bool
+     */
+    private function hasDescendantRelationships($model)
+    {
+        if (!method_exists($model, 'getActiveCascadingDeletes')) {
+            return false;
+        }
+        return count($model->getActiveCascadingDeletes()) > 0;
+    }
+
+    // Hacky way to sync the soft delete timestamp across models
+    // This is used to ensure that the soft delete timestamp is shared across all models and relationships
+    // that are using the CascadeSoftDeletes trait.
+    public function freshTimestamp() {
+        if (isset($this->syncTimestamp) && $this->syncTimestamp) {
+            return CascadeSoftDeleteTimestamp::$softDeleteTimestamp ?? Date::now();
+        }
+        return Date::now();
     }
 }
